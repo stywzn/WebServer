@@ -1,0 +1,164 @@
+没问题。既然目标是\*\*“先做项目，硬核到底”**，我们就不能只写一个“能通”的代码，而是要按照**工业级\*\*的标准来设计。
+
+要拿下严格面试，你的 WebServer 不能只是简单的 `epoll` 堆砌，必须体现出**封装性、复用性、资源管理的安全性（RAII）以及对高性能的极致追求**。
+
+这是我为你规划的**硬核开发路线图**。我们不追求快，追求的是**每一个模块都经得起深挖**。
+
+-----
+
+### 第一阶段：基石 —— 高性能 Buffer 与 RAII 封装
+
+**（很多人的项目挂就挂在没有写好 Buffer，导致处理不了粘包/拆包）**
+
+在非阻塞（Non-blocking）IO 中，你不能保证一次 `recv` 就能读完所有 HTTP 请求数据，也不能保证一次 `send` 就能把数据发完。因此，必须设计应用层缓冲区。
+
+#### 1\. 自动增长的 Buffer 设计
+
+**严格要求：**
+
+  * 不能使用定长数组（容易溢出或浪费）。
+  * 利用 `std::vector<char>` 管理内存，利用原子操作或下标管理读写指针。
+  * **杀手锏优化：** 使用 `readv` 系统调用（分散读）。
+      * *场景：* Buffer 剩余空间只有 1KB，但来了 5KB 数据。
+      * *做法：* 准备一个栈上 64KB 的临时数组 (`char extrabuf[65536]`)。利用 `readv` 同时读入 `Buffer` 和 `extrabuf`。如果 Buffer 满了，数据会自动流向栈数组，然后再把栈数组拼接到 Buffer 尾部。
+      * *意义：* **一次系统调用**就把数据全读出来了，减少了内核态切换开销。
+
+**核心代码片段 (Buffer::readFd):**
+
+```cpp
+ssize_t Buffer::readFd(int fd, int* saveErrno) {
+    char extrabuf[65536]; // 栈内存，快
+    struct iovec vec[2];
+    const size_t writable = writableBytes(); // Buffer 中可写的字节数
+    
+    // 第一块：指向 Buffer 内部
+    vec[0].iov_base = begin() + writerIndex_;
+    vec[0].iov_len = writable;
+    // 第二块：指向栈上的临时空间
+    vec[1].iov_base = extrabuf;
+    vec[1].iov_len = sizeof(extrabuf);
+    
+    // 如果 Buffer 空间够大，就不用第二块，否则同时用
+    const int iovcnt = (writable < sizeof(extrabuf)) ? 2 : 1;
+    
+    // 核心：分散读，减少 syscall
+    const ssize_t n = ::readv(fd, vec, iovcnt);
+    
+    if (n < 0) {
+        *saveErrno = errno;
+    } else if (static_cast<size_t>(n) <= writable) {
+        // 数据少，直接读到了 Buffer 里，只需移动写指针
+        writerIndex_ += n;
+    } else {
+        // Buffer 满了，部分数据在 extrabuf 里
+        writerIndex_ = buffer_.size(); // 指针移到底
+        append(extrabuf, n - writable); // 将栈数据扩容追加到 Buffer
+    }
+    return n;
+}
+```
+
+-----
+
+### 第二阶段：核心 —— Reactor 模型与 EventLoop
+
+**（这是面试官最喜欢问“线程安全”的地方）**
+
+不要把所有逻辑写在 `while(true)` 里。我们需要抽象出 `EventLoop`（事件循环）和 `Channel`（通道）。
+
+#### 1\. Channel 类
+
+  * **职责：** 封装 fd、events（感兴趣的事件）、revents（发生的事件）、callbacks（回调）。
+  * **严格要求：** 使用 `std::weak_ptr` 绑定持有者（通常是 `TcpConnection`），防止对象销毁后回调仍在执行（Core Dump 常见原因）。
+
+#### 2\. EventLoop 类
+
+  * **职责：** 持有一个 Epoll 对象，运行 `loop()` 循环。
+  * **关键难点：跨线程调用 (`runInLoop`)**。
+      * *场景：* 业务线程（线程池）计算完了，想发数据回去。但 `send` 必须在 IO 线程（Reactor）中调用，否则会有线程安全问题。
+      * *做法：* 实现一个任务队列 `std::vector<Functor> pendingFunctors_`。如果当前不是 IO 线程调用，就将任务加入队列，并**唤醒** IO 线程。
+
+**如何唤醒阻塞在 `epoll_wait` 的 IO 线程？**
+
+  * **严格面考点：** 使用 `eventfd`。创建一个 `wakeupFd`，当需要唤醒时，往里写 8 字节，Epoll 就会立刻返回，处理队列中的任务。
+
+-----
+
+### 第三阶段：生命周期 —— TcpConnection 的智能指针管理
+
+**（C++ 项目中最容易内存泄漏的地方）**
+
+我们需要一个 `TcpConnection` 类来管理一个连接的所有状态（Buffer、Socket、Channel）。
+
+  * **状态管理：** Connecting -\> Connected -\> Disconnecting -\> Disconnected。
+  * **难点：** 当连接断开时，如何安全销毁对象？
+      * 不能直接 `delete this`。
+      * 必须使用 `std::enable_shared_from_this`。
+      * 在绑定回调时，使用 `shared_from_this()` 延长生命周期，确保回调执行期间对象依然存活。
+
+-----
+
+### 第四阶段：HTTP 解析 —— 有限状态机 (FSM)
+
+**（体现你写代码逻辑严密性的地方）**
+
+不要用正则，太慢。用状态机。
+
+**严格设计：**
+
+1.  **主状态机：**
+      * `CHECK_STATE_REQUESTLINE` (正在解析请求行 GET / HTTP/1.1)
+      * `CHECK_STATE_HEADER` (正在解析头部 Host: localhost)
+      * `CHECK_STATE_CONTENT` (正在解析包体)
+2.  **从状态机（LineStatus）：**
+      * 负责从 Buffer 中切出一行 (`\r\n`)。
+3.  **处理半包：**
+      * 如果 Buffer 里的数据不足以解析出一行，状态机必须能够**挂起**（保持当前状态），直接返回，等待下一波 `epollin` 数据到来接着解析。
+
+-----
+
+### 第五阶段：高效定时器 —— 时间堆/时间轮
+
+**（解决“空闲连接占用资源”问题）**
+
+如果一个连接 60秒 没动静，必须踢掉。
+
+  * **低级做法：** 遍历所有连接检查时间。O(N)，太慢。
+  * **高级做法：** 1.  **最小堆 (Priority Queue)：** 把超时时间最早的放在堆顶。每次 Loop 只需要看堆顶是否超时。O(1) 检查，O(logN) 插入删除。
+    2\.  **时间轮 (Timing Wheel)：** 类似钟表刻度，O(1) 插入删除。（面试加分项，但最小堆通常足够）。
+
+**严格实现：**
+将 `Timer` 节点与 `TcpConnection` 绑定（使用 `weak_ptr`）。当定时器触发时，检查 `weak_ptr` 是否还能 `lock` 成功，如果能，说明连接还在，执行关闭操作。
+
+-----
+
+### 第六阶段：性能瓶颈 —— 异步日志系统 (Async Logging)
+
+**（没有这个，高并发就是空谈）**
+
+直接 `printf` 或 `std::cout` 会向屏幕输出，或者同步写文件，这极慢且会阻塞 IO 线程。
+
+**严格架构：**
+
+  * **前端（LogStream）：** 负责将日志数据格式化写入 LogBuffer。
+  * **后端（LogThread）：** 独立的后台线程。
+  * **双缓冲技术 (Double Buffering)：**
+      * 当前端 Buffer A 写满时，迅速交换给后端 Buffer B，然后唤醒后端线程去写盘。前端继续往新的 Buffer A 写。
+      * **关键点：** 锁的粒度极小（只在交换 Buffer 指针时加锁），写磁盘的操作完全不占用前端 IO 线程的时间。
+
+-----
+
+### 总结：你的开发步骤
+
+建议按照这个顺序开发，每一步都要写测试用例 (GTest) 验证：
+
+1.  **基础设施：** 封装 `Lock`, `Condition`, `Thread`。
+2.  **日志库：** 实现 `AsyncLogging`。先跑通这个，以后调试全靠它。
+3.  **IO 核心：** 实现 `Buffer`, `Socket` 封装, `Epoll` 封装。
+4.  **Reactor：** 实现 `EventLoop`, `Channel`。写个简单的 Echo Server 验证。
+5.  **协议层：** 实现 `HttpContext` (状态机)。
+6.  **连接层：** 实现 `TcpServer`, `TcpConnection`。
+7.  **完善：** 加入 `ThreadPool`, `Timer`。
+8.  **压测：** 使用 Webbench 或 Jmeter 进行压力测试（目标：QPS 上万）。
+
+**你准备先从哪一块开始动手？** 如果你想先攻克最基础但也最难写好的 **Buffer** 或者 **异步日志**，我可以给你提供具体的“严格级”代码模板。

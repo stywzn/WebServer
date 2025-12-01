@@ -1,0 +1,31 @@
+# 创建文件
+touch .gitignore
+# 使用 vim 或 code 编辑，或者直接运行下面的命令写入内容：
+cat <<EOF > .gitignore
+# 忽略编译生成目录
+build/
+bin/
+
+# 忽略临时文件和对象文件
+*.o
+*.out
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# 忽略最终可执行文件
+server
+test_pool
+test_log
+*.a
+*.so
+
+# 忽略日志文件
+*ServerLog*
+
+# 忽略 IDE 配置 (如果你用 VSCode)
+.vscode/
+.idea/
+*.swp
+EOF
